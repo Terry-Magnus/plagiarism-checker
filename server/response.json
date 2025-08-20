@@ -1,0 +1,16 @@
+{
+  "text": "Artificial intelligence (AI) refers to the simulation of human intelligence in machines that are programmed to think like humans and mimic their actions. The term may also be applied to any machine that exhibits traits associated with a human mind such as learning and problem-solving. The ideal characteristic of artificial intelligence is its ability to rationalize and take actions that have the best chance of achieving a specific goal.",
+  "results": [
+    {
+      "chunk": "Artificial intelligence (AI) refers to the simulation of human intelligence in machines that are programmed to think like humans and mimic their actions.",
+      "source": "https://insights.btoes.com/what-is-artificial-intelligence",
+      "similarity": 1
+    },
+    {
+      "chunk": "The term may also be applied to any machine that exhibits traits associated with a human mind such as learning and problem-solving.",
+      "source": "https://insights.btoes.com/what-is-artificial-intelligence",
+      "similarity": 0.8861788617886179
+    }
+  ],
+  "plagiarismPercentage": 66.66666666666666
+}
