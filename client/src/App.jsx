@@ -71,12 +71,12 @@ function App() {
       );
       highlightedText = highlightedText.replace(
         regex,
-        `<span class="bg-red-200">$1</span>`
+        `<span class="bg-red-300 text-red-600">$1</span>`
       );
     });
 
     return (
-      <div className="mt-4 p-4 bg-gray-100 rounded-lg">
+      <div className="mt-4 p-4 bg-gray-100 rounded-lg text-black">
         <h3 className="text-lg font-semibold mb-2">
           Original Text with Matches Highlighted
         </h3>
@@ -176,7 +176,7 @@ function App() {
                       [Text {i + 1}] (Similarity:{" "}
                       {(r.similarity * 100).toFixed(2)}%)
                     </p>
-                    <p className="text-sm italic bg-green-900 px-2 py-1 rounded my-2 inline-block">
+                    <p className="text-sm italic bg-red-300 text-red-500 px-2 py-1 rounded my-2 inline-block">
                       "{r.chunk}"
                     </p>
                     <p className="text-sm">

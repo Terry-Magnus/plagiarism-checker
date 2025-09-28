@@ -1,255 +1,295 @@
 # Plagiarism Checker
 
-A web-based plagiarism detection tool developed as a final year project. Users can input text or upload PDF/TXT files to check for plagiarism against online sources using the Google Custom Search API. The application displays a detailed report with matched sections, similarity scores, and a downloadable PDF summary.
+A server-side plagiarism detection service that searches the web for likely sources of copied text, scrapes page text with a headless browser, and compares text semantically using local embeddings (with a string-similarity fallback). Designed to handle both short essays and large documents (e.g., multi-page PDFs).
 
-## Features
+---
 
-- **Text Input**: Enter text via a textarea to check for plagiarism.
-- **File Upload**: Upload PDF or TXT files for analysis.
-- **Plagiarism Detection**: Compares text against web sources using the Google Custom Search API.
-- **Results Display**: Shows plagiarism percentage, matched text chunks, similarity scores, and clickable source URLs.
-- **Highlighted Text**: Highlights plagiarized sections in the original text.
-- **PDF Report**: Generates a downloadable PDF report with summary and matches.
-- **Responsive UI**: Built with React and Tailwind CSS for a modern, mobile-friendly interface.
-- **Secure**: Sanitizes inputs to prevent XSS attacks and uses CORS for secure API communication.
+## Table of contents
 
-## Tech Stack
+- Overview
+- Initial system (original) vs Current system (what we have now) — detailed comparison
+- Architecture & module breakdown (in-depth explanations)
+- Installation & configuration (summary)
+- How it works step-by-step (runtime flow)
+- Interpreting and tuning similarity results
+- Troubleshooting (common failure modes and fixes)
+- Security & sanitization notes
+- Performance, scaling and production guidance
+- Future improvements & checklist for next steps
 
-- **Backend**: Node.js, Express.js, Multer (file uploads), PDFKit (PDF generation), Axios (API requests), Sanitize-HTML (input sanitization), String-Similarity (text comparison).
-- **Frontend**: React, Tailwind CSS, Axios, React-Dropzone (file uploads).
-- **API**: Google Custom Search JSON API for plagiarism detection.
-- **Environment**: Managed with `.env` files in `frontend/` and `backend/` for secure configuration.
+---
 
-## Project Structure
+# Overview
 
-```
-plagiarism-checker/
-├── client/                    # Frontend (React)
-│   ├── src/
-│   │   ├── App.jsx             # Main React component
-│   │   └── index.css           # Tailwind CSS styles
-│   ├── package.json            # Frontend dependencies
-│   └── .env                    # Frontend environment variables
-├── server/                     # Backend (Node.js/Express)
-│   ├── routes/
-│   │   └── plagiarismRoutes.js # API routes for plagiarism check and report generation
-│   ├── PlagiarismService.js     # Text parsing and chunking logic
-│   ├── SearchService.js         # Google API search and similarity comparison
-│   ├── utils.js                # Input sanitization utilities
-│   ├── server.js               # Express server setup
-│   ├── package.json            # Backend dependencies
-│   └── .env                    # Backend environment variables
-├── README.md                   # Project documentation
-└── .gitignore                  # Git ignore file
-```
+This project detects plagiarism by:
 
-## Prerequisites
+1. Accepting user text or uploaded files.
+2. Splitting the input into sentence-aware chunks.
+3. Searching the web using Google Custom Search to find candidate pages.
+4. Scraping full page text with Puppeteer (headless Chromium).
+5. Converting text chunks to embeddings (local model `all-MiniLM-L6-v2` via `@xenova/transformers`) and comparing them with cosine similarity.
+6. Falling back to a string-similarity comparison if the embedding model is unavailable.
+7. Returning matched source(s), matched text snippets, similarity scores and an overall plagiarism percentage. Optionally generate a PDF report.
 
-- **Node.js**: Version 14 or higher.
-- **npm**: Version 6 or higher.
-- **Google Cloud Account**: For Google Custom Search API key and Search Engine ID.
-- **Browser**: Modern browser (e.g., Chrome, Firefox) for frontend testing.
+# Initial system (original) vs Current system — detailed comparison
 
-## Setup Instructions
+### Initial (original) implementation — what you started with
 
-### Backend Setup
+- **Search approach:** Each input chunk was wrapped in quotes and passed directly to Google Custom Search. The system compared the input chunk **only to the Google snippet** returned for each search result.
+- **Similarity method:** Character/string-based comparison (e.g., `string-similarity.compareTwoStrings`), typically good for near-exact matches.
+- **Scraping:** _None._ The system used only the snippet text that Google returned.
+- **Pros**
 
-1. **Navigate to Backend Directory**:
+  - Fast (no full-page fetching).
+  - Low resource usage (no headless browser, no embedding model).
+  - Simple to implement.
 
-   ```bash
-   cd server
+- **Cons**
+
+  - Snippets are short, trimmed and often paraphrased; high false negatives for paraphrase and partial matches.
+  - Very brittle — small changes in phrasing drop scores drastically.
+  - Limited context — snippet may not contain the sentence/paragraph you’re testing.
+  - Lacks capacity to handle paraphrasing or semantic similarity.
+
+### Current (improved) implementation — what we have now
+
+- **Search approach:** Google Custom Search for candidate URLs, then fetch **full page text**.
+- **Scraping:** Use **Puppeteer** to load pages and extract `document.body.innerText`, removing headers/footers/scripts/etc., so we compare against the actual web content (not just snippets).
+- **Similarity method:** Prefer **semantic embeddings** (MiniLM L6) and **cosine similarity** for comparison. If the embedding model cannot be loaded (e.g., blocked downloads), fall back to `string-similarity`.
+- **Chunking:** Both the input and scraped pages are split into sentence-aware chunks so we compare semantically similar windows of text.
+- **Pros**
+
+  - Much better detection of paraphrase and semantic similarity.
+  - Full context -> better and clearer matches for reporting.
+  - Returns the exact matched passage from the source for manual review.
+
+- **Cons**
+
+  - Heavier: scraping and embedding generation take time and CPU.
+  - Scraper can be blocked on some sites (skip those and continue).
+  - Google quota limitations become more salient — you’ll want caching and batching.
+
+**Why this change?**
+Because snippet-only comparison produced many missed cases (false negatives) — the primary objective of plagiarism detection is to catch paraphrasing and non-exact reuses, which semantic embeddings accomplish far better than literal string matching.
+
+---
+
+# Architecture & module breakdown (in-depth)
+
+Below are the modules in your repo and their roles, plus the decision rationale for each.
+
+### `chunker.js` (module)
+
+**What it does**
+
+- Sentence-aware chunking: breaks any input text into a list of chunks, aiming for a maximum length (default ~300 chars for input chunks; your scraped pages are chunked at ~600 chars).
+- Keeps sentence boundaries where possible to preserve semantic meaning.
+
+**Why it’s used**
+
+- Embeddings work best on reasonably-sized text spans. If you embed huge documents wholesale the vector dilutes; if you embed single words you lose context.
+- Chunking creates comparable units between user text and scraped page segments.
+
+**Notes / tuning**
+
+- You can tune maxLen (300–600 chars) depending on typical paragraph size.
+- Smaller chunks increase recall but produce more comparisons (more compute).
+
+---
+
+### `embeddings.js` (module)
+
+**What it does**
+
+- Attempts to dynamically import `@xenova/transformers` and instantiate a feature-extraction pipeline (MiniLM L6).
+- Exposes `getEmbeddings(texts[])` which returns vectors for each text, and `cosineSimilarity(vecA, vecB)` to compute similarity scores.
+- If `@xenova/transformers` cannot be loaded, the module returns `null` and the caller is expected to fallback to string-similarity.
+
+**Why it’s used**
+
+- Embeddings capture semantic meaning and are robust to rewording. They make paraphrase detection feasible.
+- Running locally removes reliance on a paid external API; but the dynamic import gracefully handles unavailable models.
+
+**Notes**
+
+- Model download can be blocked in some network environments — have a plan (pre-download models in CI, or allow fallback).
+- MiniLM gives ~384-dim vectors — good speed/accuracy tradeoff for this use case.
+
+---
+
+### `scraper.js` (module)
+
+**What it does**
+
+- Uses **Puppeteer** to open the page, waits for DOM to be available, removes noise elements (`script`, `style`, `noscript`, `iframe`, `header`, `footer`, `nav`, `form`) and returns normalized `document.body.innerText`.
+- Returns an empty string on failure instead of throwing — the system skips blocked sites gracefully.
+
+**Why Puppeteer (and not Cheerio)**
+
+- Puppeteer renders the page like a real browser — necessary for JavaScript-heavy sites and pages that dynamically load content.
+- Cheerio + axios is quicker and lighter but only works for static HTML pages. Since the search results include modern JS-heavy sites, Puppeteer gives better coverage and more reliable text extraction.
+
+**Trade-offs**
+
+- Puppeteer consumes more memory/CPU and is slower than axios+cheerio.
+- Many sites run anti-bot protections. The scraper logs and skips such sites rather than blocking the whole process.
+
+---
+
+### `SearchService.js` (service)
+
+**What it does**
+
+- Accepts a chunk, queries Google Custom Search for candidate URLs, caches results, iterates over the top N URLs, calls the scraper to extract page text, chunks the page text, gets embeddings for the input chunk and page segments, computes cosine similarity (or string-similarity fallback), collects _all_ page segments above threshold, and returns matches in the form: `{ chunk, matchedText, source, similarity }`.
+
+**Why it’s separate**
+
+- Encapsulates search- and web-facing logic.
+- Central place to implement caching, throttling, retry logic and logging.
+- Keeps PlagiarismService cleaner (which focuses on orchestration and reporting).
+
+**Important implementation details**
+
+- Caching (in-memory TTL) for Google results and scraped pages to save Google quota and avoid re-scraping.
+- Concurrency limits (`p-limit`) to avoid overloading the Google API or spawning too many Puppeteer instances.
+- Query generation: avoid over-quoting very long chunks — try shorter n-grams and unquoted queries when needed (to increase recall).
+- Returns multiple matches per chunk (not just top one).
+
+---
+
+### `PlagiarismService.js` (service)
+
+**What it does**
+
+- Orchestrates the flow: accepts user text, runs chunker, delegates chunk comparisons to `SearchService.checkChunks`, deduplicates results, computes plagiarism percentage (unique matched chunks / total chunks \* 100), and formats the result object for the client.
+
+**Why it’s separate**
+
+- Keeps the high-level policy (how we count plagiarism, dedup rules, thresholds) in one place, isolated from the mechanical search/scrape/compare logic.
+
+---
+
+### Routes & PDF generation (API)
+
+- **`POST /check-plagiarism`** — accepts `text` in JSON or a `file` upload (PDF/TXT). The route sanitizes input (using your reusable sanitizer), extracts text from PDFs (via `pdf-parse`), calls `PlagiarismService.analyzeTextAgainstWeb()` and returns the JSON report.
+- **`POST /generate-report`** — accepts `{ text, results, plagiarismPercentage }` and streams a PDF back to the client (via `pdfkit`). The PDF includes both the input chunk and the matched text from the source, plus similarity scores and clickable source URLs.
+
+**Notes**
+
+- For PDF safety you strip non-printable characters and optionally sanitize HTML before embedding text in the PDF.
+
+---
+
+### Utilities and supporting libraries
+
+- `node-cache` — in-memory caching for search results and scraped pages (1h TTL recommended).
+- `p-limit` — concurrency control; **note**: in CommonJS with `p-limit` v4+ you must import `.default` (`require('p-limit').default`) or use `p-limit@3`.
+- `sanitize-html` — sanitize user-submitted HTML to plain text at the API boundary (recommended).
+- `string-similarity` — fallback similarity method if embeddings are unavailable.
+- `pdf-parse`, `multer` — handling file uploads and converting PDFs to text on the server.
+
+---
+
+# Installation & configuration (summary)
+
+**Prereqs**
+
+- Node 16+ (matching your environment).
+- `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` configured in `.env`.
+- Optional: `@xenova/transformers` installed for embeddings (if you want local embeddings).
+
+**Quick steps**
+
+1. `git clone ... && cd server`
+2. `npm install` (include puppeteer, @xenova/transformers if you want embeddings, pdf-parse, sanitize-html, pdfkit, p-limit, node-cache, string-similarity, etc.)
+3. Add `.env`:
+
+   ```
+   PORT=5000
+   GOOGLE_API_KEY=...
+   GOOGLE_CSE_ID=...
    ```
 
-2. **Install Dependencies**:
+4. Ensure your server entry point calls `require('dotenv').config()` before other modules.
+5. `node server.js` (or use nodemon).
 
-   ```bash
-   npm install express cors multer pdfkit sanitize-html axios string-similarity pdf-parse dotenv
-   ```
+**Notes**
 
-3. **Configure Environment Variables**:
+- If you plan to run Puppeteer in a container, pass `--no-sandbox --disable-setuid-sandbox`.
+- If `@xenova/transformers` is blocked by network policy, the system falls back to string similarity; decide whether you require the model to be pre-downloaded in CI for production.
 
-   - Create `backend/.env`:
-     ```env
-     GOOGLE_API_KEY=your_google_api_key
-     GOOGLE_CSE_ID=your_custom_search_engine_id
-     ```
-   - Obtain `GOOGLE_API_KEY` from [Google Cloud Console](https://console.cloud.google.com):
-     - Create a project.
-     - Enable Custom Search API.
-     - Create an API key under **Credentials**.
-   - Obtain `GOOGLE_CSE_ID` from [Programmable Search Engine](https://programmablesearchengine.google.com/controlpanel/all):
-     - Create a search engine with “Search the entire web” enabled.
-     - Copy the Search Engine ID.
+---
 
-4. **Start the Backend**:
-   ```bash
-   node server.js
-   ```
-   - Server runs on `http://localhost:5000`.
+# How it works — runtime flow (step-by-step)
 
-### Frontend Setup
+1. **Receive & sanitize input**: the route first sanitizes input (strip tags via `sanitize-html` and remove non-printable chars) to avoid XSS and PDF rendering issues.
+2. **Extract text from files (if any)**: PDFs are parsed with `pdf-parse`.
+3. **Chunk input**: call `chunker.chunkBySentences(text, 300)` to produce input chunks.
+4. **For each chunk**:
 
-1. **Navigate to Frontend Directory**:
+   - `SearchService.googleSearch(chunk)` fetches top N candidate URLs (cached).
+   - For each candidate:
 
-   ```bash
-   cd client
-   ```
+     - `scraper.scrapePageText(url)` fetches rendered text with Puppeteer. If the scraper returns empty, skip.
+     - `chunkBySentences` splits the page text into page segments (600 chars).
+     - `getEmbeddings([chunk])` and `getEmbeddings(pageSegments)` produce vectors (or return null when model unavailable).
+     - Compute cosine similarity for each page segment vs chunk (or use string similarity fallback).
+     - Collect matches with `similarity >= threshold`.
 
-2. **Install Dependencies**:
+5. **Aggregate**: deduplicate matches and calculate plagiarism percentage.
+6. **Return JSON**: include the original text, results array (each item has chunk, matchedText, source, similarity), and plagiarismPercentage.
+7. **PDF (optional)**: `/generate-report` consumes the JSON result and renders a PDF showing both the input and matched text side-by-side.
 
-   ```bash
-   npm install react axios react-dropzone tailwindcss @tailwindcss/vite
-   ```
+---
 
-3. **Initialize Tailwind CSS**:
+# Interpreting and tuning similarity results
 
-   - Update `frontend/vite.config.js`:
+- **Similarity metric**: cosine similarity on embeddings returns values typically 0.0–1.0 (near 1.0 = very similar). For string-similarity, values are 0–1 similarly.
+- **Suggested thresholds**
 
-     ```javascript
-     import tailwindcss from "@tailwindcss/vite";
+  - `>= 0.80` — very likely near-verbatim or strong match.
+  - `0.65–0.80` — probable paraphrase or partial overlap (good default to flag for human review).
+  - `< 0.60` — weak match; consider lowering only for exploratory checks.
 
-      plugins: [react(), tailwindcss()],
-     ```
+- **Recommendation**: set default `similarityThreshold` ≈ `0.65` to capture paraphrase while avoiding too many false positives. Log “near matches” (e.g., `>= 0.55 && < threshold`) for reviewer visibility.
+- **Exact-match detection**: if you need to guarantee 100% on verbatim text, run a string equality / normalized-string comparison in addition to embeddings.
 
-   - Create `frontend/src/index.css`:
-     ```css
-     @import "tailwindcss";
-     ```
-   - Import in `frontend/src/main.jsx`:
-     ```javascript
-     import "./index.css";
-     ```
+---
 
-4. **Configure Environment Variables**:
+# Troubleshooting — common situations & fixes
 
-   - Create `frontend/.env`:
-     ```env
-     VITE_BASE_URL=http://localhost:5000
-     ```
+**0 results (plagiarismPercentage = 0)**
 
-5. **Start the Frontend**:
-   ```bash
-   npm start
-   ```
-   - App runs on `http://localhost:5173`.
+- Check Google search results for the chunk. If `searchResults.length === 0`, change your query generation (try an unquoted or shorter n-gram).
+- If there are search results but scraped pages are empty → scraper is failing (site blocked). Check logs for Puppeteer errors.
+- If scraped text exists but similarities are all below threshold → lower the threshold to ~0.65 or log similarity distribution to see near-misses.
 
-### API Setup
+**403/429 from Google**
 
-- **Google Custom Search API**:
-  - Free tier: ~100 queries/day (resets at midnight Pacific Time, 8:00 AM WAT).
-  - Paid tier: $5 per 1,000 queries, up to 10,000/day.
-  - Monitor usage in [Google Cloud Console](https://console.cloud.google.com/apis/dashboard).
-- **Quota Management**: Text is split into chunks (>50 characters) to minimize API calls. Caching can be added with `node-cache` for repeated queries.
+- Ensure `process.env.GOOGLE_API_KEY` and `GOOGLE_CSE_ID` are present at runtime (call `console.log(process.env.GOOGLE_API_KEY?.slice(0,8))` to verify).
+- Check Google cloud quota and billing.
+- Use caching & batching to reduce calls; consider self-hosted SearxNG for heavy usage.
 
-## Usage
+**Embedding model unavailable**
 
-1. **Open the App**:
+- If `@xenova/transformers` cannot be imported (firewalls), the module returns `null` and code falls back to `string-similarity`. For production, pre-download model weights or host a small embedding service.
 
-   - Navigate to `http://localhost:5173`.
+**Puppeteer failures**
 
-2. **Input Text or File**:
+- Some sites have aggressive anti-bot measures. Strategy:
 
-   - Enter text in the textarea or upload a PDF/TXT file via the Dropzone.
+  - Skip sites that fail and continue.
+  - Optionally use a scraping API or rotate proxies.
+  - Add realistic user-agent and extra HTTP headers (already done).
 
-3. **Check Plagiarism**:
+**p-limit**
 
-   - Click “Check Plagiarism” to analyze text.
-   - View results: plagiarism percentage, matched chunks, similarity scores, and source URLs.
-   - Matched text is highlighted in red.
+- If you get `pLimit is not a function`, either `require("p-limit").default` (for v4+) or install `p-limit@3` and `require("p-limit")` normally.
 
-4. **Download Report**:
-   - Click “Download PDF Report” to generate a PDF with summary and matches.
+---
 
-## API Endpoints
+# Security & sanitization
 
-- **POST `/check-plagiarism`**:
-
-  - **Accepts**: `multipart/form-data` with `text` (string) or `file` (PDF/TXT).
-  - **Returns**: JSON with `text`, `results` (array of matches), and `plagiarismPercentage`.
-  - **Example**:
-    ```json
-    {
-      "text": "Artificial intelligence (AI) refers to...",
-      "results": [
-        {
-          "chunk": "Artificial intelligence (AI) refers to...",
-          "source": "https://insights.btoes.com/what-is-artificial-intelligence",
-          "similarity": 1
-        }
-      ],
-      "plagiarismPercentage": 100
-    }
-    ```
-
-- **POST `/generate-report`**:
-  - **Accepts**: JSON with `text`, `results`, and `plagiarismPercentage`.
-  - **Returns**: PDF file (`plagiarism_report.pdf`).
-
-## Deployment
-
-- **Backend** (e.g., Render, Heroku):
-
-  - Deploy `client/` to a platform like Render.
-  - Set environment variables (`GOOGLE_API_KEY`, `GOOGLE_CSE_ID`) in the platform’s dashboard.
-  - Update CORS in `client/server.js`:
-    ```javascript
-    app.use(
-      cors({
-        origin: process.env.FRONTEND_URL || "http://localhost:5173",
-        methods: ["GET", "POST"],
-        allowedHeaders: ["Content-Type"],
-      })
-    );
-    ```
-  - Add to `client/.env`:
-    ```env
-    FRONTEND_URL=https://your-frontend.vercel.app
-    ```
-
-- **Frontend** (e.g., Vercel, Netlify):
-  - Deploy `frontend/` to Vercel/Netlify.
-  - Set `VITE_BASE_URL=https://your-backend.onrender.com` in the environment settings.
-  - Ensure HTTPS for both frontend and backend to avoid mixed content issues.
-
-## Testing
-
-- **Test Text**: Use a known online source (e.g., Wikipedia: “Artificial intelligence (AI) refers to...”) to verify matches.
-- **Test File**: Create a `.txt` or PDF with the same text.
-- **Curl Commands**:
-
-  ```bash
-  # Check plagiarism
-  curl -X POST http://localhost:5000/check-plagiarism \
-    -H "Content-Type: application/json" \
-    -d '{"text":"Artificial intelligence (AI) refers to..."}'
-
-  # Generate report
-  curl -X POST http://localhost:5000/generate-report \
-    -H "Content-Type: application/json" \
-    -o plagiarism_report.pdf \
-    -d '{"text":"Artificial intelligence (AI) refers to...","results":[{"chunk":"Artificial intelligence (AI) refers to...","source":"https://example.com","similarity":1}],"plagiarismPercentage":100}'
-  ```
-
-- **Quota Check**: Monitor Google API usage in [Google Cloud Console](https://console.cloud.google.com/apis/dashboard) to avoid 429 errors.
-
-## Limitations
-
-- **API Quota**: Free tier limits to ~100 queries/day. Use a 50-character chunk threshold to reduce calls.
-- **File Support**: Only PDF and TXT files are supported.
-- **Accuracy**: Depends on Google API indexing and similarity threshold (0.8).
-
-## Future Improvements
-
-- Support additional file formats (e.g., DOCX).
-- Integrate Bing Web Search API for higher free tier (1,000 queries/month).
-
-## Troubleshooting
-
-- **429 Too Many Requests**: Wait for quota reset (8:00 AM WAT) or enable billing for higher quota.
-- **CORS Errors**: Ensure `cors` middleware in `backend/server.js` allows the frontend URL.
-- **No Matches**: Test with widely indexed text (e.g., Wikipedia) or lower similarity threshold (0.8 to 0.6).
-- **Logs**: Check server console for `Chunks:` and `Search error:` messages.
-
-## Contributors
-
-- Terry Magnus - Developer
+- **Sanitize all user input** at API boundary. Use `sanitize-html` with `allowedTags: []` to strip HTML, then remove non-printable characters via regex before any processing or PDF writing.
+- **Never expose API keys to the browser** — all Google calls must be server-side.
+- **PDF safe text**: strip non-printable control characters (regex: `/[^\x09\x0A\x0D\x20-\x7E]/g`) to avoid PDF rendering issues.
