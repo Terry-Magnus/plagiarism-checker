@@ -116,11 +116,11 @@ router.post("/generate-report", async (req, res) => {
           );
 
         doc.font("Times-Bold").text("Input Chunk:");
-        doc.font("Times-Italic").text(`"${cleanText(r.chunk)}"`);
+        doc.font("Times-Italic").text(`"${r.chunk}"`);
         doc.moveDown(0.5);
 
         doc.font("Times-Bold").text("Matched Text:");
-        doc.font("Times-Italic").text(`"${cleanText(r.matchedText)}"`);
+        doc.font("Times-Italic").text(`"${r.matchedText}"`);
         doc.moveDown(0.5);
 
         doc.font("Times-Roman").text(`Source: ${r.source}`);
